@@ -16,6 +16,8 @@ if TYPE_CHECKING:
     from torch.utils.data import Dataset
 import torch.distributed as dist
 import torch.distributed.rpc as rpc
+import pickle
+import sys
 
 if IS_WINDOWS:
     import ctypes
@@ -556,3 +558,31 @@ def _rpc_worker_loop(dataset_kind, dataset, done_event, auto_collation, collate_
     # if done_event.is_set():
     #     # data_queue.cancel_join_thread()
     #     # data_queue.close()
+
+# Main Fubction - Entry Point
+if __name__ == "__main__":
+    # Extract Worker Parameters from Environment Variables
+    worker_id = int(os.environ['WORKER_ID'])
+    num_workers = int(os.environ['NUM_WORKERS'])
+    dataset_kind = os.environ['DATASET_KIND']
+    auto_collation = bool(os.environ['AUTO_COLLATION'])
+    drop_last = bool(os.environ['DROP_LAST'])
+    base_seed = int(os.environ['BASE_SEED'])
+    persistent_workers = bool(os.environ['PERSISTENT_WORKERS'])
+    shared_seed = int(os.environ['SHARED_SEED'])
+
+    worker_done_event = torch.multiprocessing.Event()
+
+    # Deserialize Dataset from Command Line Arguments
+    dataset = pickle.loads(sys.argv[1])
+
+    # Deserialize Collate Function from Command Line Arguments
+    collate_fn = pickle.loads(sys.argv[2])
+
+    # Deserialize Worker Initialization Function from Command Line Arguments
+    init_fn = pickle.loads(sys.argv[3])
+
+    # Call Worker Loop 
+    _rpc_worker_loop(dataset_kind, dataset, worker_done_event,
+                 auto_collation, collate_fn, drop_last, base_seed, init_fn, worker_id,
+                 num_workers, persistent_workers, shared_seed)
