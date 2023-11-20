@@ -6,7 +6,7 @@ import docker
 client = docker.from_env()
 
 
-def spawnContainer(image, container_name, command, environment=[], ports={}, volumes=[], ipc_mode="host"):
+def spawnContainer(image, container_name, command, environment={}, ports={}, volumes=[], ipc_mode="host"):
     # Define container options (optional)
     container_options = {
         "detach": True,    # Run the container in the background
@@ -16,7 +16,7 @@ def spawnContainer(image, container_name, command, environment=[], ports={}, vol
         "ports": ports,
         "volumes": volumes,
         "command": command,
-        "ipc_mode": ipc_mode
+        "publish_all_ports": True,
     }
 
     # Create and start the container

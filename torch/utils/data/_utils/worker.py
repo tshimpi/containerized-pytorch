@@ -564,7 +564,7 @@ if __name__ == "__main__":
     # Extract Worker Parameters from Environment Variables
     worker_id = int(os.environ['WORKER_ID'])
     num_workers = int(os.environ['NUM_WORKERS'])
-    dataset_kind = os.environ['DATASET_KIND']
+    dataset_kind = int(os.environ['DATASET_KIND'])
     auto_collation = bool(os.environ['AUTO_COLLATION'])
     drop_last = bool(os.environ['DROP_LAST'])
     base_seed = int(os.environ['BASE_SEED'])

@@ -12,6 +12,7 @@ import os
 import queue
 import threading
 import warnings
+import pickle
 
 from typing import Any, Callable, Iterable, TypeVar, Generic, List, Optional, Union
 
@@ -1530,21 +1531,22 @@ class _MultiProcessingRPCDataLoaderIter(_BaseDataLoaderIter):
             # Need to `cancel_join_thread` here!
             # See sections (2) and (3b) above.
 
-            w = multiprocessing_context.Process(
-                target=_utils.worker._rpc_worker_loop,
-                args=(self._dataset_kind, self._dataset,
-                      self._workers_done_event,
-                      self._auto_collation, self._collate_fn, self._drop_last,
-                      self._base_seed, self._worker_init_fn, i, self._num_workers,
-                      self._persistent_workers, self._shared_seed))
-            w.daemon = True
-            # NB: Process.start() actually take some time as it needs to
-            #     start a process and pass the arguments over via a pipe.
-            #     Therefore, we only add a worker to self._workers list after
-            #     it started, so that we do not call .join() if program dies
-            #     before it starts, and __del__ tries to join but will get:
-            #     AssertionError: can only join a started process.
-            w.start()
+            # w = multiprocessing_context.Process(
+            #     target=_utils.worker._rpc_worker_loop,
+            #     args=(self._dataset_kind, self._dataset,
+            #           self._workers_done_event,
+            #           self._auto_collation, self._collate_fn, self._drop_last,
+            #           self._base_seed, self._worker_init_fn, i, self._num_workers,
+            #           self._persistent_workers, self._shared_seed))
+            # w.daemon = True
+            # # NB: Process.start() actually take some time as it needs to
+            # #     start a process and pass the arguments over via a pipe.
+            # #     Therefore, we only add a worker to self._workers list after
+            # #     it started, so that we do not call .join() if program dies
+            # #     before it starts, and __del__ tries to join but will get:
+            # #     AssertionError: can only join a started process.
+            # w.start()
+            self._create_container(i)
             self._workers.append(w)
         
         dist.init_process_group(backend='gloo', rank=0, world_size=self._num_workers+1)
@@ -1594,6 +1596,30 @@ class _MultiProcessingRPCDataLoaderIter(_BaseDataLoaderIter):
         _utils.signal_handling._set_SIGCHLD_handler()
         self._worker_pids_set = True
         self._reset(loader, first_iter=True)
+
+    # args=(self._dataset_kind, self._dataset,
+    #         #           self._workers_done_event,
+    #         #           self._auto_collation, self._collate_fn, self._drop_last,
+    #         #           self._base_seed, self._worker_init_fn, i, self._num_workers,
+    #         #           self._persistent_workers, self._shared_seed))
+    def _create_container(self, worker_id):
+        dataset_pickle = str(pickle.dumps(self._dataset, 0))
+        collate_fn_pickle = str(pickle.dumps(self._collate_fn, 0))
+        init_fn_pickle = str(pickle.dumps(self._worker_init_fn, 0))
+
+        environment_dict = {
+            "WORKER_ID" : str(worker_id),
+            "DATASET_KIND": str(self._dataset_kind),
+            "AUTO_COLLATION": str(self._auto_collation),
+            "DROP_LAST": str(self._drop_last),
+            "BASE_SEED": str(self._base_seed),
+            "PERSISTENT_WORKERS": str(self._persistent_workers),
+            "SHARED_SEED": str(self._shared_seed),
+            "NUM_WORKERS": str(self._num_workers),
+        }
+        command = 'python worker.py ' + dataset_pickle + ' ' + collate_fn_pickle + ' ' + init_fn_pickle
+        _utils.spawn_container.spawnContainer(image='kadle11/pytorch_worker', container_name="worker_"+str(worker_id), command=command, environment=environment_dict)
+
 
     def _reset(self, loader, first_iter=False):
         super()._reset(loader, first_iter)
