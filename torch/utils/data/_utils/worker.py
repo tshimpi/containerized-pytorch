@@ -14,6 +14,8 @@ from typing import Optional, Union, TYPE_CHECKING
 from . import signal_handling, MP_STATUS_CHECK_INTERVAL, IS_WINDOWS, HAS_NUMPY
 if TYPE_CHECKING:
     from torch.utils.data import Dataset
+import torch.distributed as dist
+import torch.distributed.rpc as rpc
 
 if IS_WINDOWS:
     import ctypes
@@ -84,6 +86,10 @@ class WorkerInfo:
         for k in self.__keys:
             items.append(f'{k}={getattr(self, k)}')
         return f"{self.__class__.__name__}({', '.join(items)})"
+
+# # Creates a global state for all the RPC calls to use.
+# class RPCPayload:
+
 
 
 def get_worker_info() -> Optional[WorkerInfo]:
@@ -241,8 +247,6 @@ def _worker_loop(dataset_kind, dataset, index_queue, data_queue, done_event,
         _worker_info = WorkerInfo(id=worker_id, num_workers=num_workers,
                                   seed=seed, dataset=dataset)
 
-        from torch.utils.data import _DatasetKind
-
         init_exception = None
 
         try:
@@ -326,4 +330,229 @@ def _worker_loop(dataset_kind, dataset, index_queue, data_queue, done_event,
         pass
     if done_event.is_set():
         data_queue.cancel_join_thread()
-        data_queue.close()
+        data_queue.close() 
+
+# List shared by the rpc function and the rpc worker loop.
+worker_index_queue = queue.Queue()
+worker_data_queue = queue.Queue()
+
+def get_data_rpc(dataloader_index):
+    print("Received index from dataloader")
+    print(torch.ones(1,1))
+    return
+    # worker_index_queue.put(dataloader_index)
+    # print("Put it in the queue")
+    # #Wait for the worker to process the data.
+    # data_tuple = worker_data_queue.get()
+    # return data_tuple
+
+# def get_and_transform_data_rpc(dataloader_index):
+#     # Perform the entire transformation as part of the RPC.
+#     r = dataloader_index
+#     print("worker got index from dataloader")
+#     print(r)
+#     if isinstance(r, _ResumeIteration):
+#         # Acknowledge the main process
+#         worker_data_queue.put((r, None))
+#         iteration_end = False
+
+#         if isinstance(dataset, IterDataPipe):
+#             assert r.seed is not None
+#             shared_rng.manual_seed(r.seed)
+#             dataset = apply_random_seed(dataset, shared_rng)
+
+#         # Recreate the fetcher for worker-reuse policy
+#         fetcher = _DatasetKind.create_fetcher(
+#             dataset_kind, dataset, auto_collation, collate_fn, drop_last)
+#         continue
+#     elif r is None:
+#         # Received the final signal
+#         assert done_event.is_set() or iteration_end
+#         worker_data_queue.put(None)
+#         break
+#     elif done_event.is_set() or iteration_end:
+#         # `done_event` is set. But I haven't received the final signal
+#         # (None) yet. I will keep continuing until get it, and skip the
+#         # processing steps.
+#         worker_data_queue.put(None)
+#         continue
+#     idx, index = r
+#     data: Union[_IterableDatasetStopIteration, ExceptionWrapper]
+#     if init_exception is not None:
+#         data = init_exception
+#         init_exception = None
+#     else:
+#         try:
+#             data = fetcher.fetch(index)
+#         except Exception as e:
+#             if isinstance(e, StopIteration) and dataset_kind == _DatasetKind.Iterable:
+#                 data = _IterableDatasetStopIteration(worker_id)
+#                 # Set `iteration_end`
+#                 #   (1) to save future `next(...)` calls, and
+#                 #   (2) to avoid sending multiple `_IterableDatasetStopIteration`s.
+#                 iteration_end = True
+#             else:
+#                 # It is important that we don't store exc_info in a variable.
+#                 # `ExceptionWrapper` does the correct thing.
+#                 # See NOTE [ Python Traceback Reference Cycle Problem ]
+#                 data = ExceptionWrapper(
+#                     where=f"in DataLoader worker process {worker_id}")
+#     # data_queue.put((idx, data))
+#     worker_data_queue.put((idx, data))
+
+#     del data, idx, index, r  # save memor   y
+#     return
+
+
+def _rpc_worker_loop(dataset_kind, dataset, done_event, auto_collation, collate_fn, drop_last, base_seed, init_fn, worker_id,
+                 num_workers, persistent_workers, shared_seed):
+    # See NOTE [ Data Loader Multiprocessing Shutdown Logic ] for details on the
+    # logic of this function.
+
+    # Set master address for handshaking
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    # os.environ['TP_SOCKET_IFNAME']='tun0' 
+    # os.environ['GLOO_SOCKET_IFNAME']='tun0'
+
+    print("Set the master address and port for worker " + str(worker_id))
+    dist.init_process_group(backend='gloo', rank=worker_id+1, world_size=num_workers+1)
+    rpc.init_rpc("worker"+str(worker_id+1), rank=worker_id+1, world_size=num_workers+1)
+
+    print("Connection established!")
+
+    #TODO: Set the rpc_index_queue and worker_data_queue to empty every call of rpc_worker_loop
+    with worker_data_queue.mutex:
+        print("data queue cleared")
+        worker_data_queue.queue.clear()
+    with worker_index_queue.mutex:
+        print("index queue cleared")
+        worker_index_queue.queue.clear()
+    
+    try:
+        # Initialize C side signal handlers for SIGBUS and SIGSEGV. Python signal
+        # module's handlers are executed after Python returns from C low-level
+        # handlers, likely when the same fatal signal had already happened
+        # again.
+        # https://docs.python.org/3/library/signal.html#execution-of-python-signal-handlers
+        signal_handling._set_worker_signal_handlers()
+
+        torch.set_num_threads(1)
+        seed = base_seed + worker_id
+        random.seed(seed) 
+        torch.manual_seed(seed)
+        if HAS_NUMPY:
+            import numpy as np
+            np_seed = _generate_state(base_seed, worker_id)
+            np.random.seed(np_seed)
+
+        from torch.utils.data import IterDataPipe
+        from torch.utils.data.graph_settings import apply_random_seed
+
+        shared_rng = torch.Generator()
+        if isinstance(dataset, IterDataPipe):
+            assert shared_seed is not None
+            shared_rng.manual_seed(shared_seed)
+            dataset = apply_random_seed(dataset, shared_rng)
+
+        global _worker_info
+        _worker_info = WorkerInfo(id=worker_id, num_workers=num_workers,
+                                  seed=seed, dataset=dataset)
+
+        from torch.utils.data import _DatasetKind
+
+        init_exception = None
+
+        try:
+            if init_fn is not None:
+                init_fn(worker_id)
+
+            fetcher = _DatasetKind.create_fetcher(dataset_kind, dataset, auto_collation, collate_fn, drop_last)
+        except Exception:
+            init_exception = ExceptionWrapper(
+                where=f"in DataLoader worker process {worker_id}")
+
+        # When using Iterable mode, some worker can exit earlier than others due
+        # to the IterableDataset behaving differently for different workers.
+        # When such things happen, an `_IterableDatasetStopIteration` object is
+        # sent over to the main process with the ID of this worker, so that the
+        # main process won't send more tasks to this worker, and will send
+        # `None` to this worker to properly exit it.
+        #
+        # Note that we cannot set `done_event` from a worker as it is shared
+        # among all processes. Instead, we set the `iteration_end` flag to
+        # signify that the iterator is exhausted. When either `done_event` or
+        # `iteration_end` is set, we skip all processing step and just wait for
+        # `None`.
+        iteration_end = False
+
+        watchdog = ManagerWatchdog()
+
+        while watchdog.is_alive():
+            try:
+                r = worker_index_queue.get(timeout=MP_STATUS_CHECK_INTERVAL) # NOTE: get from the local queue.
+                print("worker got index from dataloader")
+                print(r)
+            except queue.Empty:
+                print("Queue is empty on the worker")
+                continue
+            except IndexError:
+                worker_data_queue.put(None)
+                continue
+            if isinstance(r, _ResumeIteration):
+                # Acknowledge the main process
+                worker_data_queue.put((r, None))
+                iteration_end = False
+
+                if isinstance(dataset, IterDataPipe):
+                    assert r.seed is not None
+                    shared_rng.manual_seed(r.seed)
+                    dataset = apply_random_seed(dataset, shared_rng)
+
+                # Recreate the fetcher for worker-reuse policy
+                fetcher = _DatasetKind.create_fetcher(
+                    dataset_kind, dataset, auto_collation, collate_fn, drop_last)
+                continue
+            elif r is None:
+                # Received the final signal
+                assert done_event.is_set() or iteration_end
+                worker_data_queue.put(None)
+                break
+            elif done_event.is_set() or iteration_end:
+                # `done_event` is set. But I haven't received the final signal
+                # (None) yet. I will keep continuing until get it, and skip the
+                # processing steps.
+                worker_data_queue.put(None)
+                continue
+            idx, index = r
+            data: Union[_IterableDatasetStopIteration, ExceptionWrapper]
+            if init_exception is not None:
+                data = init_exception
+                init_exception = None
+            else:
+                try:
+                    data = fetcher.fetch(index)
+                except Exception as e:
+                    if isinstance(e, StopIteration) and dataset_kind == _DatasetKind.Iterable:
+                        data = _IterableDatasetStopIteration(worker_id)
+                        # Set `iteration_end`
+                        #   (1) to save future `next(...)` calls, and
+                        #   (2) to avoid sending multiple `_IterableDatasetStopIteration`s.
+                        iteration_end = True
+                    else:
+                        # It is important that we don't store exc_info in a variable.
+                        # `ExceptionWrapper` does the correct thing.
+                        # See NOTE [ Python Traceback Reference Cycle Problem ]
+                        data = ExceptionWrapper(
+                            where=f"in DataLoader worker process {worker_id}")
+            # data_queue.put((idx, data))
+            print(idx, data)
+            worker_data_queue.put((idx, data))
+           
+            del data, idx, index, r  # save memor   y
+    except KeyboardInterrupt:
+        # Main process will raise KeyboardInterrupt anyways.
+        pass
+    # if done_event.is_set():
+    #     # data_queue.cancel_join_thread()
+    #     # data_queue.close()
