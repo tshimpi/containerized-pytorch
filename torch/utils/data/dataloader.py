@@ -685,7 +685,6 @@ class _SingleProcessDataLoaderIter(_BaseDataLoaderIter):
             data = _utils.pin_memory.pin_memory(data, self._pin_memory_device)
         return data
 
-
 class _MultiProcessingDataLoaderIter(_BaseDataLoaderIter):
     r"""Iterates once over the DataLoader's dataset, as specified by the sampler"""
 
@@ -1024,7 +1023,7 @@ class _MultiProcessingDataLoaderIter(_BaseDataLoaderIter):
         self._workers_done_event = multiprocessing_context.Event()
 
         self._index_queues = []
-        self._workers = []
+        # self._workers = []
         for i in range(self._num_workers):
             # No certainty which module multiprocessing_context is
             index_queue = multiprocessing_context.Queue()  # type: ignore[var-annotated]
@@ -1047,7 +1046,7 @@ class _MultiProcessingDataLoaderIter(_BaseDataLoaderIter):
             #     AssertionError: can only join a started process.
             w.start()
             self._index_queues.append(index_queue)
-            self._workers.append(w)
+            # self._workers.append(w)
 
         if self._pin_memory:
             self._pin_memory_thread_done_event = threading.Event()
@@ -1490,6 +1489,9 @@ class _MultiProcessingDataLoaderIter(_BaseDataLoaderIter):
 def get_data_rpc(dataloader_index):
     return 5
 
+def get_dataset_rpc():
+    return dataloader_dataset
+
 class _MultiProcessingRPCDataLoaderIter(_BaseDataLoaderIter):
     r"""Iterates once over the DataLoader's dataset, as specified by the sampler. Uses gRPC to communicate with the worker processes."""
 
@@ -1501,6 +1503,8 @@ class _MultiProcessingRPCDataLoaderIter(_BaseDataLoaderIter):
         # Set master address for handshaking of RPCs
         os.environ['MASTER_ADDR'] = 'localhost'
         os.environ['MASTER_PORT'] = '12355'
+        os.environ['RANK'] = '0'
+        os.environ['WORLD_SIZE'] = str(self._num_workers+1)
 
         self._prefetch_factor = loader.prefetch_factor
 
@@ -1514,6 +1518,9 @@ class _MultiProcessingRPCDataLoaderIter(_BaseDataLoaderIter):
 
         self._worker_init_fn = loader.worker_init_fn
 
+        global dataloader_dataset
+        dataloader_dataset = self._dataset
+
         # Adds forward compatibilities so classic DataLoader can work with DataPipes:
         #   Additional worker init function will take care of sharding in MP and Distributed
         if isinstance(self._dataset, (IterDataPipe, MapDataPipe)):
@@ -1525,7 +1532,7 @@ class _MultiProcessingRPCDataLoaderIter(_BaseDataLoaderIter):
         self._workers_done_event = multiprocessing_context.Event()
         self.local_data_queue = queue.Queue()
 
-        self._workers = []
+        # self._workers = []
         for i in range(self._num_workers):
             # No certainty which module multiprocessing_context is
             # Need to `cancel_join_thread` here!
@@ -1540,14 +1547,14 @@ class _MultiProcessingRPCDataLoaderIter(_BaseDataLoaderIter):
             #           self._persistent_workers, self._shared_seed))
             # w.daemon = True
             # # NB: Process.start() actually take some time as it needs to
-            # #     start a process and pass the arguments over via a pipe.
+            # #     start a process and pas the arguments over via a pipe.
             # #     Therefore, we only add a worker to self._workers list after
             # #     it started, so that we do not call .join() if program dies
             # #     before it starts, and __del__ tries to join but will get:
             # #     AssertionError: can only join a started process.
             # w.start()
             self._create_container(i)
-            self._workers.append(w)
+            # self._workers.append(w)
         
         dist.init_process_group(backend='gloo', rank=0, world_size=self._num_workers+1)
         rpc.init_rpc("dataloader", rank=0, world_size=self._num_workers+1)
@@ -1586,26 +1593,27 @@ class _MultiProcessingRPCDataLoaderIter(_BaseDataLoaderIter):
         # corrupted data from worker_result_queue
         # atexit is used to shutdown thread and child processes in the
         # right sequence before main process exits
-        if self._persistent_workers and self._pin_memory:
-            import atexit
-            for w in self._workers:
-                atexit.register(_MultiProcessingDataLoaderIter._clean_up_worker, w)
+
+        # NOTE: TODO: Removed as it will be handled with the containers.
+        # if self._persistent_workers and self._pin_memory:
+        #     import atexit
+        #     for w in self._workers:
+        #         atexit.register(_MultiProcessingDataLoaderIter._clean_up_worker, w)
 
         # .pid can be None only before process is spawned (not the case, so ignore)
-        _utils.signal_handling._set_worker_pids(id(self), tuple(w.pid for w in self._workers))  # type: ignore[misc]
-        _utils.signal_handling._set_SIGCHLD_handler()
-        self._worker_pids_set = True
+        # _utils.signal_handling._set_worker_pids(id(self), tuple(w.pid for w in self._workers))  # type: ignore[misc]
+        # _utils.signal_handling._set_SIGCHLD_handler()
+        # self._worker_pids_set = True
+        self._worker_pids_set = False
         self._reset(loader, first_iter=True)
 
-    # args=(self._dataset_kind, self._dataset,
-    #         #           self._workers_done_event,
-    #         #           self._auto_collation, self._collate_fn, self._drop_last,
-    #         #           self._base_seed, self._worker_init_fn, i, self._num_workers,
-    #         #           self._persistent_workers, self._shared_seed))
     def _create_container(self, worker_id):
         dataset_pickle = str(pickle.dumps(self._dataset, 0))
+        print("Dataset" + str(self._dataset))
         collate_fn_pickle = str(pickle.dumps(self._collate_fn, 0))
+        # print("Collate fn" + str(self._collate_fn))
         init_fn_pickle = str(pickle.dumps(self._worker_init_fn, 0))
+        # print("Init fn" + str(self._worker_init_fn))
 
         environment_dict = {
             "WORKER_ID" : str(worker_id),
@@ -1617,8 +1625,12 @@ class _MultiProcessingRPCDataLoaderIter(_BaseDataLoaderIter):
             "SHARED_SEED": str(self._shared_seed),
             "NUM_WORKERS": str(self._num_workers),
         }
-        command = 'python worker.py ' + dataset_pickle + ' ' + collate_fn_pickle + ' ' + init_fn_pickle
-        _utils.spawn_container.spawnContainer(image='kadle11/pytorch_worker', container_name="worker_"+str(worker_id), command=command, environment=environment_dict)
+
+        volume_dict = {'/data': {'bind': '/data', 'mode': 'rw'}}
+        command = 'python worker.py'
+        # print("Spawning container with command " + command)
+        _utils.spawn_container.spawnContainer(image='kadle11/pytorch_worker:debug', container_name="worker_"+str(worker_id), command=command, environment=environment_dict, volumes=volume_dict)
+        print("Spawned container")
 
 
     def _reset(self, loader, first_iter=False):
@@ -1674,132 +1686,37 @@ class _MultiProcessingRPCDataLoaderIter(_BaseDataLoaderIter):
             # At timeout and error, we manually check whether any worker has
             # failed. Note that this is the only mechanism for Windows to detect
             # worker failures.
-            failed_workers = []
-            for worker_id, w in enumerate(self._workers):
-                if self._workers_status[worker_id] and not w.is_alive():
-                    failed_workers.append(w)    
-                    self._mark_worker_as_unavailable(worker_id)
-            if len(failed_workers) > 0:
-                pids_str = ', '.join(str(w.pid) for w in failed_workers)
-                raise RuntimeError(f'DataLoader worker (pid(s) {pids_str}) exited unexpectedly') from e
-            if isinstance(e, queue.Empty):
-                return (False, None)
-            import tempfile
-            import errno
-            try:
-                # Raise an exception if we are this close to the FDs limit.
-                # Apparently, trying to open only one file is not a sufficient
-                # test.
-                # See NOTE [ DataLoader on Linux and open files limit ]
-                fds_limit_margin = 10
-                fs = [tempfile.NamedTemporaryFile() for i in range(fds_limit_margin)]
-            except OSError as e:
-                if e.errno == errno.EMFILE:
-                    raise RuntimeError(
-                        "Too many open files. Communication with the"
-                        " workers is no longer possible. Please increase the"
-                        " limit using `ulimit -n` in the shell or change the"
-                        " sharing strategy by calling"
-                        " `torch.multiprocessing.set_sharing_strategy('file_system')`"
-                        " at the beginning of your code") from None
-            raise
+            raise RuntimeError(f'There os an issue with get data. The handling is removed for containerization.') from e
+            # failed_workers = []
+            # for worker_id, w in enumerate(self._workers):
+            #     if self._workers_status[worker_id] and not w.is_alive():
+            #         failed_workers.append(w)    
+            #         self._mark_worker_as_unavailable(worker_id)
+            # if len(failed_workers) > 0:
+            #     pids_str = ', '.join(str(w.pid) for w in failed_workers)
+            #     raise RuntimeError(f'DataLoader worker (pid(s) {pids_str}) exited unexpectedly') from e
+            # if isinstance(e, queue.Empty):
+            #     return (False, None)
+            # import tempfile
+            # import errno
+            # try:
+            #     # Raise an exception if we are this close to the FDs limit.
+            #     # Apparently, trying to open only one file is not a sufficient
+            #     # test.
+            #     # See NOTE [ DataLoader on Linux and open files limit ]
+            #     fds_limit_margin = 10
+            #     fs = [tempfile.NamedTemporaryFile() for i in range(fds_limit_margin)]
+            # except OSError as e:
+            #     if e.errno == errno.EMFILE:
+            #         raise RuntimeError(
+            #             "Too many open files. Communication with the"
+            #             " workers is no longer possible. Please increase the"
+            #             " limit using `ulimit -n` in the shell or change the"
+            #             " sharing strategy by calling"
+            #             " `torch.multiprocessing.set_sharing_strategy('file_system')`"
+            #             " at the beginning of your code") from None
+            # raise
 
-# NOTE [ DataLoader on Linux and open files limit ]
-#
-# On Linux when DataLoader is used with multiprocessing we pass the data between
-# the root process and the workers through SHM files. We remove those files from
-# the filesystem as soon as they are created and keep them alive by
-# passing around their file descriptors through AF_UNIX sockets. (See
-# docs/source/multiprocessing.rst and 'Multiprocessing Technical Notes` in
-# the wiki (https://github.com/pytorch/pytorch/wiki).)
-#
-# This sometimes leads us to exceeding the open files limit. When that happens,
-# and the offending file descriptor is coming over a socket, the `socket` Python
-# package silently strips the file descriptor from the message, setting only the
-# `MSG_CTRUNC` flag (which might be a bit misleading since the manpage says that
-# it _indicates that some control data were discarded due to lack of space in
-# the buffer for ancillary data_). This might reflect the C implementation of
-# AF_UNIX sockets.
-#
-# This behaviour can be reproduced with the script and instructions at the
-# bottom of this note.
-#
-# When that happens, the standard Python `multiprocessing` (and not
-# `torch.multiprocessing`) raises a `RuntimeError: received 0 items of ancdata`
-#
-# Sometimes, instead of the FD being stripped, you may get an `OSError:
-# Too many open files`, both in the script below and in DataLoader. However,
-# this is rare and seems to be nondeterministic.
-#
-#
-#   #!/usr/bin/env python3
-#   import sys
-#   import socket
-#   import os
-#   import array
-#   import shutil
-#   import socket
-#
-#
-#   if len(sys.argv) != 4:
-#       print("Usage: ", sys.argv[0], " tmp_dirname iteration (send|recv)")
-#       sys.exit(1)
-#
-#   if __name__ == '__main__':
-#       dirname = sys.argv[1]
-#       sock_path = dirname + "/sock"
-#       iterations = int(sys.argv[2])
-#       def dummy_path(i):
-#           return dirname + "/" + str(i) + ".dummy"
-#
-#
-#       if sys.argv[3] == 'send':
-#           while not os.path.exists(sock_path):
-#               pass
-#           client = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-#           client.connect(sock_path)
-#           for i in range(iterations):
-#               fd = os.open(dummy_path(i), os.O_WRONLY | os.O_CREAT)
-#               ancdata = array.array('i', [fd])
-#               msg = bytes([i % 256])
-#               print("Sending fd ", fd, " (iteration #", i, ")")
-#               client.sendmsg([msg], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, ancdata)])
-#
-#
-#       else:
-#           assert sys.argv[3] == 'recv'
-#
-#           if os.path.exists(dirname):
-#               raise Exception("Directory exists")
-#
-#           os.mkdir(dirname)
-#
-#           print("Opening socket...")
-#           server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-#           server.bind(sock_path)
-#
-#           print("Listening...")
-#           for i in range(iterations):
-#               a = array.array('i')
-#               msg, ancdata, flags, addr = server.recvmsg(1, socket.CMSG_SPACE(a.itemsize))
-#               assert(len(ancdata) == 1)
-#               cmsg_level, cmsg_type, cmsg_data = ancdata[0]
-#               a.frombytes(cmsg_data)
-#               print("Received fd ", a[0], " (iteration #", i, ")")
-#
-#           shutil.rmtree(dirname)
-#
-# Steps to reproduce:
-#
-# 1. Run two shells and set lower file descriptor limit in the receiving one:
-# (shell1) ulimit -n 1020
-# (shell2) ulimit -n 1022
-#
-# 2. Run the script above with the `recv` option in the first shell
-# (shell1) ./test_socket.py sock_tmp 1017 recv
-#
-# 3. Run the script with the `send` option in the second shell:
-# (shell2) ./test_socket.py sock_tmp 1017 send
 
     def _get_data(self):
         # Fetches data from `self._data_queue`.
@@ -1896,7 +1813,7 @@ class _MultiProcessingRPCDataLoaderIter(_BaseDataLoaderIter):
     def put_index_rpc(self, worker_idx, index):
         # Give the designated worker the index asynchronously
         print("Worker selected: " + str(worker_idx+1)) 
-        worker_result_future = rpc.rpc_sync("worker"+str(worker_idx+1), get_data_rpc, args=(index,))
+        worker_result_future = rpc.rpc_async("worker"+str(worker_idx+1), get_data_rpc, args=(index,))
         print(worker_result_future)
         # worker_result_future.then(self.worker_callback)
         print("Put index rpc ends")
@@ -1956,6 +1873,7 @@ class _MultiProcessingRPCDataLoaderIter(_BaseDataLoaderIter):
 
         assert self._workers_done_event.is_set() == shutdown
 
+    # NOTE: Shutdown workers does nothing now!
     def _shutdown_workers(self):
         # Called when shutting down this `_MultiProcessingDataLoaderIter`.
         # See NOTE [ Data Loader Multiprocessing Shutdown Logic ] for details on
@@ -1985,20 +1903,24 @@ class _MultiProcessingRPCDataLoaderIter(_BaseDataLoaderIter):
                 #     self._worker_result_queue.close()
 
                 # Exit workers now.
-                self._workers_done_event.set()
-                for worker_id in range(len(self._workers)):
-                    # Get number of workers from `len(self._workers)` instead of
-                    # `self._num_workers` in case we error before starting all
-                    # workers.
-                    # If we are using workers_status with persistent_workers
-                    # we have to shut it down because the worker is paused
-                    if self._persistent_workers or self._workers_status[worker_id]:
-                        self._mark_worker_as_unavailable(worker_id, shutdown=True)
-                for w in self._workers:
-                    # We should be able to join here, but in case anything went
-                    # wrong, we set a timeout and if the workers fail to join,
-                    # they are killed in the `finally` block.
-                    w.join(timeout=_utils.MP_STATUS_CHECK_INTERVAL)
+                # NOTE: TODO Vishal : Add the container exit code here. 
+                pass
+
+
+                # self._workers_done_event.set()
+                # for worker_id in range(len(self._workers)):
+                #     # Get number of workers from `len(self._workers)` instead of
+                #     # `self._num_workers` in case we error before starting all
+                #     # workers.
+                #     # If we are using workers_status with persistent_workers
+                #     # we have to shut it down because the worker is paused
+                #     if self._persistent_workers or self._workers_status[worker_id]:
+                #         self._mark_worker_as_unavailable(worker_id, shutdown=True)
+                # for w in self._workers:
+                #     # We should be able to join here, but in case anything went
+                #     # wrong, we set a timeout and if the workers fail to join,
+                #     # they are killed in the `finally` block.
+                #     w.join(timeout=_utils.MP_STATUS_CHECK_INTERVAL)
 
             finally:
                 # Even though all this function does is putting into queues that
@@ -2011,16 +1933,17 @@ class _MultiProcessingRPCDataLoaderIter(_BaseDataLoaderIter):
                 # FIXME: Unfortunately, for Windows, we are missing a worker
                 #        error detection mechanism here in this function, as it
                 #        doesn't provide a SIGCHLD handler.
-                if self._worker_pids_set:
-                    _utils.signal_handling._remove_worker_pids(id(self))
-                    self._worker_pids_set = False
-                for w in self._workers:
-                    if w.is_alive():
-                        # Existing mechanisms try to make the workers exit
-                        # peacefully, but in case that we unfortunately reach
-                        # here, which we shouldn't, (e.g., pytorch/pytorch#39570),
-                        # we kill the worker.
-                        w.terminate()
+                # if self._worker_pids_set:
+                #     _utils.signal_handling._remove_worker_pids(id(self))
+                #     self._worker_pids_set = False
+                # for w in self._workers:
+                #     if w.is_alive():
+                #         # Existing mechanisms try to make the workers exit
+                #         # peacefully, but in case that we unfortunately reach
+                #         # here, which we shouldn't, (e.g., pytorch/pytorch#39570),
+                #         # we kill the worker.
+                #         w.terminate()
+                pass
 
     # staticmethod is used to remove reference to `_MultiProcessingDataLoaderIter`
     @staticmethod

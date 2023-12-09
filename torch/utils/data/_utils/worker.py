@@ -5,19 +5,22 @@ static methods.
 """
 
 import torch
+# import torchvision
+# import torchvision.transforms as transforms
 import random
 import os
 import queue
 from dataclasses import dataclass
 from torch._utils import ExceptionWrapper
 from typing import Optional, Union, TYPE_CHECKING
-from . import signal_handling, MP_STATUS_CHECK_INTERVAL, IS_WINDOWS, HAS_NUMPY
+from torch.utils.data._utils import signal_handling, MP_STATUS_CHECK_INTERVAL, IS_WINDOWS, HAS_NUMPY
 if TYPE_CHECKING:
     from torch.utils.data import Dataset
 import torch.distributed as dist
 import torch.distributed.rpc as rpc
 import pickle
 import sys
+from torch.utils.data._utils.collate import default_collate  
 
 if IS_WINDOWS:
     import ctypes
@@ -348,6 +351,9 @@ def get_data_rpc(dataloader_index):
     # data_tuple = worker_data_queue.get()
     # return data_tuple
 
+def get_dataset_rpc():
+    pass
+
 # def get_and_transform_data_rpc(dataloader_index):
 #     # Perform the entire transformation as part of the RPC.
 #     r = dataloader_index
@@ -406,7 +412,7 @@ def get_data_rpc(dataloader_index):
 #     return
 
 
-def _rpc_worker_loop(dataset_kind, dataset, done_event, auto_collation, collate_fn, drop_last, base_seed, init_fn, worker_id,
+def _rpc_worker_loop(dataset_kind, done_event, auto_collation, collate_fn, drop_last, base_seed, init_fn, worker_id,
                  num_workers, persistent_workers, shared_seed):
     # See NOTE [ Data Loader Multiprocessing Shutdown Logic ] for details on the
     # logic of this function.
@@ -422,6 +428,9 @@ def _rpc_worker_loop(dataset_kind, dataset, done_event, auto_collation, collate_
     rpc.init_rpc("worker"+str(worker_id+1), rank=worker_id+1, world_size=num_workers+1)
 
     print("Connection established!")
+
+    dataset = rpc.rpc_sync("dataloader", get_dataset_rpc, args=())
+    print("Got the dataset from the dataloader")    
 
     #TODO: Set the rpc_index_queue and worker_data_queue to empty every call of rpc_worker_loop
     with worker_data_queue.mutex:
@@ -569,20 +578,19 @@ if __name__ == "__main__":
     drop_last = bool(os.environ['DROP_LAST'])
     base_seed = int(os.environ['BASE_SEED'])
     persistent_workers = bool(os.environ['PERSISTENT_WORKERS'])
-    shared_seed = int(os.environ['SHARED_SEED'])
-
+    shared_seed = None
+    if os.environ['SHARED_SEED'] != "None":
+        shared_seed = int(os.environ['SHARED_SEED'])
+        
     worker_done_event = torch.multiprocessing.Event()
 
-    # Deserialize Dataset from Command Line Arguments
-    dataset = pickle.loads(sys.argv[1])
-
     # Deserialize Collate Function from Command Line Arguments
-    collate_fn = pickle.loads(sys.argv[2])
+    collate_fn = default_collate
 
     # Deserialize Worker Initialization Function from Command Line Arguments
-    init_fn = pickle.loads(sys.argv[3])
+    init_fn = None
 
     # Call Worker Loop 
-    _rpc_worker_loop(dataset_kind, dataset, worker_done_event,
+    _rpc_worker_loop(dataset_kind, worker_done_event,
                  auto_collation, collate_fn, drop_last, base_seed, init_fn, worker_id,
                  num_workers, persistent_workers, shared_seed)

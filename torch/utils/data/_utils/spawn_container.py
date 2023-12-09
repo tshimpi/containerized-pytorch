@@ -6,8 +6,9 @@ import docker
 client = docker.from_env()
 
 
-def spawnContainer(image, container_name, command, environment={}, ports={}, volumes=[], ipc_mode="host"):
+def spawnContainer(image, container_name, command, environment={}, ports={}, volumes={}, ipc_mode="host"):
     # Define container options (optional)
+    print("Spawn container called")
     container_options = {
         "detach": True,    # Run the container in the background
         "tty": True,       # Allocate a pseudo-TTY
@@ -16,7 +17,8 @@ def spawnContainer(image, container_name, command, environment={}, ports={}, vol
         "ports": ports,
         "volumes": volumes,
         "command": command,
-        "publish_all_ports": True,
+        "publish_all_ports": True
+        # "network": "host",
     }
 
     # Create and start the container
